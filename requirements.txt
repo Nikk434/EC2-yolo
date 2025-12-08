@@ -1,0 +1,5 @@
+boto3
+botocore
+ultralytics
+opencv-python-headless
+numpy
