@@ -4,49 +4,65 @@ import time
 from ultralytics import YOLO
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
-load_dotenv()
-print("Starting YOLO worker...")
 
-# env vars
-QUEUE_URL = os.environ.get("QUEUE_URL")
+load_dotenv()
+
+print("Starting YOLO processor (single image mode)...")
+
+# Environment variables
 INPUT_BUCKET = os.environ.get("INPUT_BUCKET")
 OUTPUT_BUCKET = os.environ.get("OUTPUT_BUCKET")
 MODEL_PATH = os.environ.get("MODEL_PATH")
 AWS_REGION = os.environ.get("AWS_REGION")
+IMAGE_KEY = os.environ.get("IMAGE_KEY")  # Optional: specify exact key, e.g. "input.jpg"
 
 print("ENV CHECK")
-print("QUEUE_URL:", QUEUE_URL)
 print("INPUT_BUCKET:", INPUT_BUCKET)
 print("OUTPUT_BUCKET:", OUTPUT_BUCKET)
 print("MODEL_PATH:", MODEL_PATH)
 print("AWS_REGION:", AWS_REGION)
+print("IMAGE_KEY (optional):", IMAGE_KEY)
 
-# if not QUEUE_URL or not INPUT_BUCKET or not OUTPUT_BUCKET:
-#     raise ValueError("Missing required environment variables")
-
-print("Creating AWS clients...")
+if not INPUT_BUCKET or not OUTPUT_BUCKET or not MODEL_PATH:
+    raise ValueError("Missing required environment variables: INPUT_BUCKET, OUTPUT_BUCKET, MODEL_PATH")
 
 # AWS clients
-sqs = boto3.client("sqs", region_name=AWS_REGION)
+print("Creating AWS clients...")
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 print("Loading YOLO model...")
 model = YOLO(MODEL_PATH)
 print("Model loaded successfully")
 
+def get_single_object_key(bucket):
+    """Find the single object in the bucket (assumes only one image exists)"""
+    response = s3.list_objects_v2(Bucket=bucket, MaxKeys=10)
+    if 'Contents' not in response or len(response['Contents']) == 0:
+        raise ValueError(f"No objects found in bucket {bucket}")
+    if len(response['Contents']) > 1:
+        print(f"Warning: Multiple objects found in {bucket}. Picking the first one.")
+    
+    key = response['Contents'][0]['Key']
+    print(f"Found object in bucket: {key}")
+    return key
+
 def process_image(key):
-    print("Processing image:", key)
+    print(f"Processing image: {key}")
 
     local_input = "/tmp/input.jpg"
     local_output_dir = "/tmp/output"
+
+    # Ensure /tmp exists (safe on Windows too in most cases, or use current dir)
+    os.makedirs("/tmp", exist_ok=True)
+    os.makedirs(local_output_dir, exist_ok=True)
 
     print("Downloading from S3...")
     s3.download_file(INPUT_BUCKET, key, local_input)
     print("Downloaded to:", local_input)
 
     print("Running YOLO inference...")
-    model.predict(
-        local_input,
+    results = model.predict(
+        source=local_input,
         conf=0.8,
         iou=0.5,
         save=True,
@@ -54,68 +70,43 @@ def process_image(key):
         name="result",
         exist_ok=True
     )
-    print("YOLO inference done")
+    print("YOLO inference completed")
 
+    # Find the output image (usually the one with labels drawn)
     out_dir = os.path.join(local_output_dir, "result")
-    print("Checking output dir:", out_dir)
-
     if not os.path.exists(out_dir):
-        print("Output directory not found")
+        print("Output directory not found!")
         return
 
-    files = os.listdir(out_dir)
-    print("Output files:", files)
-
+    files = [f for f in os.listdir(out_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
     if not files:
-        print("No output generated")
+        print("No output image generated")
         return
 
     output_path = os.path.join(out_dir, files[0])
-    print("Uploading result to S3:", output_path)
+    print(f"Result image ready: {output_path}")
 
-    s3.upload_file(output_path, OUTPUT_BUCKET, key)
-    print("Upload complete")
+    output_key = key  # Save with same name, or modify if needed: f"result_{key}"
+    print(f"Uploading result to s3://{OUTPUT_BUCKET}/{output_key}")
+    s3.upload_file(output_path, OUTPUT_BUCKET, output_key)
+    print("Upload complete!")
 
-def worker_loop():
-    print("Entering worker loop...")
+def main():
+    print("Starting single-image processing...")
 
-    while True:
-        print("Waiting for SQS message...")
-        msgs = sqs.receive_message(
-            QueueUrl=QUEUE_URL,
-            MaxNumberOfMessages=1,
-            WaitTimeSeconds=10
-        )
+    # Determine which image to process
+    if IMAGE_KEY:
+        key = IMAGE_KEY.strip()
+        print(f"Using specified IMAGE_KEY: {key}")
+    else:
+        print("No IMAGE_KEY provided. Auto-detecting single object in input bucket...")
+        key = get_single_object_key(INPUT_BUCKET)
 
-        if "Messages" not in msgs:
-            print("No messages received")
-            continue
-
-        msg = msgs["Messages"][0]
-        receipt = msg["ReceiptHandle"]
-
-        print("Message received")
-
-        try:
-            body = eval(msg["Body"])
-            record = body["Records"][0]
-            key = record["s3"]["object"]["key"]
-            print("S3 object key:", key)
-        except Exception as e:
-            print("Failed to parse SQS message:", e)
-            sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=receipt)
-            continue
-
-        try:
-            process_image(key)
-        except Exception as e:
-            print("Error during processing:", e)
-
-        print("Deleting SQS message")
-        sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=receipt)
-
-        print("Sleeping...\n")
-        time.sleep(1)
+    try:
+        process_image(key)
+        print("Processing completed successfully!")
+    except Exception as e:
+        print("Error during processing:", str(e))
 
 if __name__ == "__main__":
-    worker_loop()
+    main()
