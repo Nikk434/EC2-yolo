@@ -3,7 +3,8 @@ import os
 import time
 from ultralytics import YOLO
 from botocore.exceptions import ClientError
-
+from dotenv import load_dotenv
+load_dotenv()
 print("Starting YOLO worker...")
 
 # env vars
@@ -20,8 +21,8 @@ print("OUTPUT_BUCKET:", OUTPUT_BUCKET)
 print("MODEL_PATH:", MODEL_PATH)
 print("AWS_REGION:", AWS_REGION)
 
-if not QUEUE_URL or not INPUT_BUCKET or not OUTPUT_BUCKET:
-    raise ValueError("Missing required environment variables")
+# if not QUEUE_URL or not INPUT_BUCKET or not OUTPUT_BUCKET:
+#     raise ValueError("Missing required environment variables")
 
 print("Creating AWS clients...")
 
