@@ -2,6 +2,7 @@ import boto3
 import os
 import json
 import ssl
+import time
 from ultralytics import YOLO
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
@@ -15,32 +16,20 @@ INPUT_BUCKET = os.environ.get("INPUT_BUCKET")
 OUTPUT_BUCKET = os.environ.get("OUTPUT_BUCKET")
 MODEL_PATH = os.environ.get("MODEL_PATH")
 AWS_REGION = os.environ.get("AWS_REGION")
-IMAGE_KEY = os.environ.get("IMAGE_KEY")  # Optional: specific image key
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 5))  # seconds
 
 # MQTT Settings
-MQTT_BROKER = os.environ.get("MQTT_BROKER")          # Required: your AWS IoT endpoint
+MQTT_BROKER = os.environ.get("MQTT_BROKER")          # AWS IoT endpoint
 MQTT_PORT = int(os.environ.get("MQTT_PORT", 8883))
 MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "yolo/detections/test")
 
-# Certificate paths from .env (secure & flexible)
+# Certificate paths
 ROOT_CA_PATH = os.environ.get("CERT_ROOT_CA")
 CERT_PATH = os.environ.get("CERT_DEVICE")
 KEY_PATH = os.environ.get("CERT_KEY")
 
-# Print env check (never prints secrets)
-print("ENV CHECK")
-print("INPUT_BUCKET:", INPUT_BUCKET)
-print("OUTPUT_BUCKET:", OUTPUT_BUCKET)
-print("MODEL_PATH:", MODEL_PATH)
-print("AWS_REGION:", AWS_REGION)
-print("IMAGE_KEY:", IMAGE_KEY)
-print("MQTT_BROKER:", MQTT_BROKER)
-print("MQTT_PORT:", MQTT_PORT)
-print("MQTT_TOPIC:", MQTT_TOPIC)
-print("Cert paths configured:", bool(ROOT_CA_PATH and CERT_PATH and KEY_PATH))
-
 # Validate required vars
-required = [INPUT_BUCKET, OUTPUT_BUCKET, MODEL_PATH, MQTT_BROKER, ROOT_CA_PATH, CERT_PATH, KEY_PATH]
+required = [INPUT_BUCKET, OUTPUT_BUCKET, MODEL_PATH, MQTT_BROKER, ROOT_CA_PATH, CERT_PATH, KEY_PATH, AWS_REGION]
 if not all(required):
     raise ValueError("Missing one or more required environment variables")
 
@@ -53,7 +42,7 @@ for path, name in [(ROOT_CA_PATH, "Root CA"), (CERT_PATH, "Device Cert"), (KEY_P
 print("Creating S3 client...")
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
-# === Secure MQTT Client for AWS IoT Core ===
+# === Secure MQTT Client ===
 print("Setting up secure MQTT client...")
 mqtt_client = mqtt.Client(client_id="yolo-worker-client-001")
 mqtt_client.tls_set(
@@ -65,8 +54,8 @@ mqtt_client.tls_set(
 
 try:
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-    mqtt_client.loop_start()  # Background thread for reliable connection
-    print(f"Successfully connected to AWS IoT Core: {MQTT_BROKER}:{MQTT_PORT}")
+    mqtt_client.loop_start()
+    print(f"Connected to AWS IoT Core: {MQTT_BROKER}:{MQTT_PORT}")
 except Exception as e:
     raise ConnectionError(f"Failed to connect to AWS IoT Core: {e}")
 
@@ -76,15 +65,28 @@ model = YOLO(MODEL_PATH)
 print("Model loaded successfully!")
 
 # === Helper Functions ===
+
 def get_single_object_key(bucket):
+    """Return the first image object in the bucket, if any."""
     response = s3.list_objects_v2(Bucket=bucket, MaxKeys=10)
     if 'Contents' not in response or len(response['Contents']) == 0:
-        raise ValueError(f"No objects found in bucket {bucket}")
-    if len(response['Contents']) > 1:
-        print(f"Warning: Multiple objects in {bucket}. Using the first one.")
-    key = response['Contents'][0]['Key']
-    print(f"Selected image: {key}")
-    return key
+        raise ValueError("No images found in input bucket.")
+    # Filter image files
+    for obj in response['Contents']:
+        key = obj['Key']
+        if key.lower().endswith(('.jpg', '.jpeg', '.png')):
+            print(f"Selected image for processing: {key}")
+            return key
+    raise ValueError("No valid image found in input bucket.")
+
+def delete_previous_output(key):
+    """Delete previous output image and JSON from output bucket."""
+    try:
+        s3.delete_object(Bucket=OUTPUT_BUCKET, Key=key)
+        s3.delete_object(Bucket=OUTPUT_BUCKET, Key=os.path.splitext(key)[0] + ".json")
+        print(f"Deleted previous output image and JSON: {key}")
+    except Exception as e:
+        print(f"No previous output to delete or error: {e}")
 
 def process_image(key):
     print(f"\n--- Processing image: {key} ---")
@@ -97,10 +99,10 @@ def process_image(key):
     os.makedirs(local_output_dir, exist_ok=True)
 
     # Download image
-    print("Downloading from S3...")
+    print("Downloading image from S3...")
     s3.download_file(INPUT_BUCKET, key, local_input)
 
-    # Run inference
+    # Run YOLO inference
     print("Running YOLO inference...")
     results = model.predict(
         source=local_input,
@@ -153,7 +155,7 @@ def process_image(key):
     print("Uploading JSON payload to S3...")
     s3.upload_file(json_output_path, OUTPUT_BUCKET, output_json_key)
 
-    # Publish to AWS IoT Core MQTT
+    # Publish to MQTT
     print(f"Publishing detection event to topic: {MQTT_TOPIC}")
     try:
         result = mqtt_client.publish(MQTT_TOPIC, json.dumps(payload), qos=1)
@@ -162,20 +164,33 @@ def process_image(key):
     except Exception as e:
         print(f"MQTT publish failed: {e}")
 
-# === Main Execution ===
-def main():
-    print("\n=== Starting Single Image Processing ===")
+    # Delete input image after processing
     try:
-        key = IMAGE_KEY.strip() if IMAGE_KEY else get_single_object_key(INPUT_BUCKET)
-        process_image(key)
-        print("\n=== Processing Completed Successfully! ===")
+        s3.delete_object(Bucket=INPUT_BUCKET, Key=key)
+        print(f"Deleted input image from S3: {key}")
     except Exception as e:
-        print(f"\n!!! Error during processing: {e} !!!")
+        print(f"Failed to delete input image: {e}")
+
+# === Continuous Main Loop ===
+def main_loop():
+    print("=== Starting Continuous YOLO Worker ===")
+    try:
+        while True:
+            try:
+                key = get_single_object_key(INPUT_BUCKET)
+                delete_previous_output(key)
+                process_image(key)
+            except ValueError as ve:
+                print(ve)
+            except Exception as e:
+                print(f"Error processing image: {e}")
+            time.sleep(POLL_INTERVAL)
+    except KeyboardInterrupt:
+        print("Stopping worker...")
     finally:
-        print("Cleaning up MQTT connection...")
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
         print("MQTT disconnected.")
 
 if __name__ == "__main__":
-    main()
+    main_loop()
