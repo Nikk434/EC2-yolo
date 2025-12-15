@@ -3,3 +3,5 @@ botocore
 ultralytics
 opencv-python-headless
 numpy
+python-dotenv
+paho-mqtt
