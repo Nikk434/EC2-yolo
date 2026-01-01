@@ -1,26 +1,23 @@
 import os
 import json
 import ssl
-import time
 import boto3
 from ultralytics import YOLO
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
+from urllib.parse import unquote_plus
 
 # ==========================================================
 # ENV + BOOTSTRAP
 # ==========================================================
-load_dotenv("D:/EC2-yolo/backend/.env.local")
+load_dotenv("/home/ubuntu/project/EC2-yolo/backend/.env")
 
 print("[BOOT] YOLO Worker starting (SQS driven)")
 
-AWS_PROFILE = os.getenv("AWS_PROFILE")
 AWS_REGION = os.getenv("AWS_REGION")
-
 INPUT_BUCKET = os.getenv("INPUT_BUCKET")
 OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET")
 SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
-
 MODEL_PATH = os.getenv("MODEL_PATH")
 
 POLL_WAIT_TIME = int(os.getenv("POLL_WAIT_TIME", 20))
@@ -35,30 +32,22 @@ CERT_PATH = os.getenv("CERT_DEVICE")
 KEY_PATH = os.getenv("CERT_KEY")
 
 required = [
-    AWS_PROFILE, AWS_REGION,
-    INPUT_BUCKET, OUTPUT_BUCKET, SQS_QUEUE_URL,
-    MODEL_PATH,
-    MQTT_BROKER, ROOT_CA_PATH, CERT_PATH, KEY_PATH
+    AWS_REGION, INPUT_BUCKET, OUTPUT_BUCKET, SQS_QUEUE_URL,
+    MODEL_PATH, MQTT_BROKER, ROOT_CA_PATH, CERT_PATH, KEY_PATH
 ]
 
 if not all(required):
     raise RuntimeError("Missing required environment variables")
 
-print(f"[BOOT] Using AWS profile: {AWS_PROFILE}")
-
 # ==========================================================
-# AWS SESSION (PROFILE EXPLICIT)
+# AWS CLIENTS
 # ==========================================================
-session = boto3.Session(
-    profile_name=AWS_PROFILE,
-    region_name=AWS_REGION
-)
-
+session = boto3.Session(region_name=AWS_REGION)
 s3 = session.client("s3")
 sqs = session.client("sqs")
 
 # ==========================================================
-# MQTT SETUP
+# MQTT SETUP (AWS IoT Core)
 # ==========================================================
 print("[BOOT] Connecting to AWS IoT Core")
 
@@ -83,21 +72,20 @@ model = YOLO(MODEL_PATH)
 print("[BOOT] Model ready")
 
 # ==========================================================
-# HELPERS
+# PROCESS SQS MESSAGE
 # ==========================================================
 def process_message(message):
     body = json.loads(message["Body"])
-
-    # S3 event → SQS format
     record = body["Records"][0]
+
     bucket = record["s3"]["bucket"]["name"]
-    key = record["s3"]["object"]["key"]
+    raw_key = record["s3"]["object"]["key"]
+    key = unquote_plus(raw_key)
 
     print(f"[JOB] Processing s3://{bucket}/{key}")
 
     local_input = "/tmp/input.jpg"
     output_dir = "/tmp/output"
-    json_path = "/tmp/result.json"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -127,12 +115,6 @@ def process_message(message):
 
     status = "rec" if detections else "unrec"
 
-    payload = {
-        "image_key": key,
-        "status": status,
-        "detections": detections
-    }
-
     out_img_dir = os.path.join(output_dir, "result")
     annotated_img = next(
         f for f in os.listdir(out_img_dir)
@@ -141,22 +123,22 @@ def process_message(message):
 
     annotated_path = os.path.join(out_img_dir, annotated_img)
 
-    print("[S3] Uploading outputs")
+    print("[S3] Uploading output image")
     s3.upload_file(annotated_path, OUTPUT_BUCKET, key)
-    s3.upload_file(
-        json_path,
-        OUTPUT_BUCKET,
-        os.path.splitext(key)[0] + ".json"
-    )
 
-    print("[MQTT] Publishing event")
+    payload = {
+        "image_key": key,
+        "status": status,
+        "detections": detections
+    }
+
+    print("[MQTT] Publishing result")
     mqtt_client.publish(MQTT_TOPIC, json.dumps(payload), qos=1)
 
     print("[JOB] Done:", key)
 
-
 # ==========================================================
-# MAIN LOOP (LONG POLL)
+# MAIN LOOP
 # ==========================================================
 print("[RUN] Waiting for SQS messages")
 
@@ -177,11 +159,19 @@ while True:
 
     try:
         process_message(message)
+
         sqs.delete_message(
             QueueUrl=SQS_QUEUE_URL,
             ReceiptHandle=message["ReceiptHandle"]
         )
         print("[SQS] Message deleted")
+
     except Exception as e:
         print("[ERROR]", e)
-        print("[SQS] Message will retry after visibility timeout")
+
+        # Delete bad message to avoid infinite retry
+        sqs.delete_message(
+            QueueUrl=SQS_QUEUE_URL,
+            ReceiptHandle=message["ReceiptHandle"]
+        )
+        print("[SQS] Bad message deleted")
